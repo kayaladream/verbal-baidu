@@ -3,23 +3,36 @@ const https = require('https');
 const zlib = require('zlib');
 
 // Cloud Run 会通过 PORT 环境变量指定监听端口，默认 8080
-// 必须监听 '0.0.0.0'，否则 Cloud Run 无法从容器外部访问服务
 const PORT = process.env.PORT || 8080;
 
-// 从 JSONL 文件中提取最终文本
+// 从 JSONL 文件中提取最终文本（修复多行拼接问题）
 function extractTextFromJsonl(jsonlText, modelId) {
     const lines = jsonlText.trim().split('\n').filter(Boolean);
     if (lines.length === 0) return '';
 
-    const resultObj = JSON.parse(lines[0])?.result || {};
+    let fullText = '';
+    for (const line of lines) {
+        try {
+            const resultObj = JSON.parse(line)?.result || {};
+            let lineText = '';
 
-    if (modelId === 'baidu-ocrv6' || modelId === 'baidu-ocrv5') {
-        return resultObj?.ocrResults
-            ?.flatMap(res => res.prunedResult?.rec_texts || [])
-            .filter(Boolean)
-            .join('\n') || '';
+            if (modelId === 'baidu-ocrv6' || modelId === 'baidu-ocrv5') {
+                lineText = resultObj?.ocrResults
+                    ?.flatMap(res => res.prunedResult?.rec_texts || [])
+                    .filter(Boolean)
+                    .join('\n') || '';
+            } else {
+                lineText = resultObj?.layoutParsingResults?.[0]?.markdown?.text || '';
+            }
+
+            if (lineText) {
+                fullText += lineText + '\n\n'; // 每个识别块之间保留空行
+            }
+        } catch (e) {
+            console.error('解析 JSONL 某一行失败:', e.message);
+        }
     }
-    return resultObj?.layoutParsingResults?.[0]?.markdown?.text || '';
+    return fullText.trim();
 }
 
 http.createServer((req, res) => {
@@ -52,7 +65,7 @@ http.createServer((req, res) => {
     const proxyReq = https.request(options, (proxyRes) => {
         console.log(`[${new Date().toLocaleTimeString()}] 目标返回状态码: ${proxyRes.statusCode}`);
 
-        // 判断是否是需要提取文本的结果文件
+        // 判断是否是需要提取文本的结果文件（bcebos.com 且包含 .jsonl）
         const isResultFile = targetUrl.includes('bcebos.com') && targetUrl.includes('.jsonl');
 
         if (isResultFile && proxyRes.statusCode === 200) {
