@@ -1,42 +1,11 @@
 const http = require('http');
 const https = require('https');
-const zlib = require('zlib');
 
-// Cloud Run 会通过 PORT 环境变量指定监听端口，默认 8080
+// 云函数计算 Web 函数会通过环境变量 FC_SERVER_PORT 指定监听端口
 const PORT = process.env.PORT || 8080;
 
-// 从 JSONL 文件中提取最终文本（修复多行拼接问题）
-function extractTextFromJsonl(jsonlText, modelId) {
-    const lines = jsonlText.trim().split('\n').filter(Boolean);
-    if (lines.length === 0) return '';
-
-    let fullText = '';
-    for (const line of lines) {
-        try {
-            const resultObj = JSON.parse(line)?.result || {};
-            let lineText = '';
-
-            if (modelId === 'baidu-ocrv6' || modelId === 'baidu-ocrv5') {
-                lineText = resultObj?.ocrResults
-                    ?.flatMap(res => res.prunedResult?.rec_texts || [])
-                    .filter(Boolean)
-                    .join('\n') || '';
-            } else {
-                lineText = resultObj?.layoutParsingResults?.[0]?.markdown?.text || '';
-            }
-
-            if (lineText) {
-                fullText += lineText + '\n\n'; // 每个识别块之间保留空行
-            }
-        } catch (e) {
-            console.error('解析 JSONL 某一行失败:', e.message);
-        }
-    }
-    return fullText.trim();
-}
-
 http.createServer((req, res) => {
-    // 健康检查路由
+    // 健康检查路由，用于函数计算平台确认服务已启动
     if (req.url === '/health' || req.url === '/') {
         res.writeHead(200, { 'Content-Type': 'text/plain' });
         return res.end('OK');
@@ -52,60 +21,36 @@ http.createServer((req, res) => {
         return res.end('Forbidden');
     }
 
+    // 解析目标 URL，准备转发
     const options = new URL(targetUrl);
     options.method = req.method;
 
-    // 复制原始请求头，并移除 host
+    // 复制原始请求头，并移除 host（因为目标 host 需要重新设置）
     const headers = { ...req.headers };
     delete headers.host;
+    // 必须保留 authorization，百度接口需要 Bearer Token 鉴权
+    // 同时保留 content-type、content-length 等用于文件上传的头部
     headers.host = options.host;
     options.headers = headers;
 
     // 发起 HTTPS 转发请求
     const proxyReq = https.request(options, (proxyRes) => {
-        console.log(`[${new Date().toLocaleTimeString()}] 目标返回状态码: ${proxyRes.statusCode}`);
-
-        // 判断是否是需要提取文本的结果文件（bcebos.com 且包含 .jsonl）
-        const isResultFile = targetUrl.includes('bcebos.com') && targetUrl.includes('.jsonl');
-
-        if (isResultFile && proxyRes.statusCode === 200) {
-            const chunks = [];
-            proxyRes.on('data', chunk => chunks.push(chunk));
-            proxyRes.on('end', () => {
-                let body = Buffer.concat(chunks);
-
-                // 处理 gzip 压缩
-                const encoding = proxyRes.headers['content-encoding'];
-                if (encoding === 'gzip') {
-                    body = zlib.gunzipSync(body);
-                }
-
-                const jsonlText = body.toString('utf-8');
-                const modelId = req.headers['x-model-id'] || 'baidu-vl-1.6';
-                const extractedText = extractTextFromJsonl(jsonlText, modelId);
-
-                console.log(`[结果提取] 原始JSONL大小: ${body.length} bytes, 提取后文本长度: ${extractedText.length} 字符`);
-
-                res.writeHead(200, {
-                    'Content-Type': 'text/plain; charset=utf-8',
-                    'x-extracted-text': 'true'
-                });
-                res.end(extractedText);
-            });
-        } else {
-            // 非结果文件请求，正常透传
-            res.writeHead(proxyRes.statusCode, proxyRes.headers);
-            proxyRes.pipe(res);
-        }
+        console.log(`[${new Date().toLocaleTimeString()}] 百度返回状态码: ${proxyRes.statusCode}`);
+        // 将百度返回的响应头和状态码原样转发给客户端
+        res.writeHead(proxyRes.statusCode, proxyRes.headers);
+        proxyRes.pipe(res);
     });
 
+    // 转发错误处理
     proxyReq.on('error', (e) => {
         console.error('代理转发错误:', e.message);
         res.writeHead(500);
         res.end(e.message);
     });
 
+    // 将客户端请求体流式转发到百度
     req.pipe(proxyReq);
+
 }).listen(PORT, '0.0.0.0', () => {
     console.log(`代理服务器正在运行，监听端口 ${PORT}`);
 });
